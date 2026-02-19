@@ -1,6 +1,9 @@
 """
 RunPod Serverless Handler for ComfyUI - Indus Image Generator
 Receives a ComfyUI API-format workflow, executes it, returns base64 image.
+
+ComfyUI is started BEFORE the serverless listener so the worker
+registers as "ready" only once ComfyUI is fully loaded.
 """
 
 import runpod
@@ -15,7 +18,6 @@ import threading
 
 COMFYUI_URL = "http://127.0.0.1:8188"
 COMFYUI_PATH = os.environ.get("COMFYUI_PATH", "/comfyui")
-comfyui_process = None
 
 
 def log(msg):
@@ -23,10 +25,7 @@ def log(msg):
 
 
 def start_comfyui():
-    """Start ComfyUI server once and keep it running across requests."""
-    global comfyui_process
-
-    # Already running?
+    """Start ComfyUI and block until it's ready."""
     try:
         r = requests.get(f"{COMFYUI_URL}/system_stats", timeout=3)
         if r.status_code == 200:
@@ -36,7 +35,7 @@ def start_comfyui():
         pass
 
     log(f"Starting ComfyUI from {COMFYUI_PATH}...")
-    comfyui_process = subprocess.Popen(
+    process = subprocess.Popen(
         [
             sys.executable, "main.py",
             "--listen", "0.0.0.0",
@@ -50,14 +49,13 @@ def start_comfyui():
     )
 
     def _stream():
-        for line in iter(comfyui_process.stdout.readline, b""):
+        for line in iter(process.stdout.readline, b""):
             text = line.decode("utf-8", errors="ignore").strip()
             if text:
                 log(f"ComfyUI: {text[:300]}")
 
     threading.Thread(target=_stream, daemon=True).start()
 
-    # Wait up to 5 minutes for ComfyUI to be ready
     deadline = time.time() + 300
     while time.time() < deadline:
         try:
@@ -127,9 +125,6 @@ def handler(event):
 
         log(f"Received workflow with {len(workflow)} nodes")
 
-        if not start_comfyui():
-            return {"error": "Failed to start ComfyUI"}
-
         log("Queuing workflow...")
         resp = queue_prompt(workflow)
         if "error" in resp:
@@ -159,4 +154,12 @@ def handler(event):
         return {"error": str(e)}
 
 
+# Start ComfyUI BEFORE the serverless listener so models are loaded
+# and the worker only becomes "ready" once ComfyUI is fully up.
+log("=== Indus ComfyUI Serverless Handler ===")
+if not start_comfyui():
+    log("FATAL: ComfyUI failed to start. Exiting.")
+    sys.exit(1)
+
+log("ComfyUI running. Starting RunPod serverless listener...")
 runpod.serverless.start({"handler": handler})
