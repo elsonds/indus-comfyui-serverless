@@ -2,8 +2,8 @@
 RunPod Serverless Handler for ComfyUI - Indus Image Generator
 Receives a ComfyUI API-format workflow, executes it, returns base64 image.
 
-ComfyUI is started BEFORE the serverless listener so the worker
-registers as "ready" only once ComfyUI is fully loaded.
+On first boot: downloads models, starts ComfyUI, then accepts jobs.
+On subsequent boots (Flash Boot): models already cached, fast startup.
 """
 
 import runpod
@@ -19,13 +19,52 @@ import threading
 COMFYUI_URL = "http://127.0.0.1:8188"
 COMFYUI_PATH = os.environ.get("COMFYUI_PATH", "/comfyui")
 
+MODELS = [
+    {
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_2512_bf16.safetensors",
+        "path": f"{COMFYUI_PATH}/models/diffusion_models/qwen_image_2512_bf16.safetensors",
+    },
+    {
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "path": f"{COMFYUI_PATH}/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    },
+    {
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors",
+        "path": f"{COMFYUI_PATH}/models/vae/qwen_image_vae.safetensors",
+    },
+    {
+        "url": "https://huggingface.co/ArceusInception/iis/resolve/main/indus-style.safetensors",
+        "path": f"{COMFYUI_PATH}/models/loras/indus-style.safetensors",
+    },
+]
+
 
 def log(msg):
     print(f"[Handler] {msg}", flush=True)
 
 
+def download_models():
+    """Download any missing models. Skips files that already exist (Flash Boot cache)."""
+    for m in MODELS:
+        if os.path.exists(m["path"]):
+            size_mb = os.path.getsize(m["path"]) / (1024 * 1024)
+            log(f"Model exists ({size_mb:.0f}MB): {os.path.basename(m['path'])}")
+            continue
+        os.makedirs(os.path.dirname(m["path"]), exist_ok=True)
+        name = os.path.basename(m["path"])
+        log(f"Downloading {name}...")
+        start = time.time()
+        subprocess.run(
+            ["wget", "-q", "--show-progress", "-O", m["path"], m["url"]],
+            check=True,
+        )
+        elapsed = round(time.time() - start)
+        size_mb = os.path.getsize(m["path"]) / (1024 * 1024)
+        log(f"Downloaded {name} ({size_mb:.0f}MB) in {elapsed}s")
+
+
 def start_comfyui():
-    """Start ComfyUI and block until it's ready."""
+    """Start ComfyUI and block until ready."""
     try:
         r = requests.get(f"{COMFYUI_URL}/system_stats", timeout=3)
         if r.status_code == 200:
@@ -154,12 +193,13 @@ def handler(event):
         return {"error": str(e)}
 
 
-# Start ComfyUI BEFORE the serverless listener so models are loaded
-# and the worker only becomes "ready" once ComfyUI is fully up.
+# === Startup sequence ===
 log("=== Indus ComfyUI Serverless Handler ===")
+log("Step 1: Download models (skips if cached)...")
+download_models()
+log("Step 2: Start ComfyUI...")
 if not start_comfyui():
     log("FATAL: ComfyUI failed to start. Exiting.")
     sys.exit(1)
-
-log("ComfyUI running. Starting RunPod serverless listener...")
+log("Step 3: Ready! Starting RunPod serverless listener...")
 runpod.serverless.start({"handler": handler})
